@@ -1,6 +1,6 @@
 # Online Quiz Exam Backend
 
-Backend service for creating, browsing, and taking MCQ quizzes.
+Backend service for creating, browsing, and taking time-limited MCQ quizzes with JWT auth.
 
 ## Stack
 
@@ -29,23 +29,54 @@ Run the API:
 uvicorn app.main:app --reload
 ```
 
-The API will create tables on startup for Phase 1 simplicity. In a production phase, replace this with Alembic migrations.
+The API creates tables on startup for local development simplicity. Because Phase 3 changes the user table from header-based prototype users to JWT users, delete the old local SQLite file once if you are using the default database:
+
+```powershell
+Remove-Item .\online_quiz_exam.db
+```
+
+In production, use Alembic migrations instead of `create_all`.
 
 ## Main Endpoints
 
+- `POST /auth/register` - create a teacher or student account
+- `POST /auth/login` - get a bearer access token
 - `GET /quizzes` - list available quizzes
-- `POST /quizzes` - create a quiz
+- `POST /quizzes` - teacher creates a quiz
 - `GET /quizzes/{quiz_id}` - get quiz details without correct answers
-- `POST /quizzes/{quiz_id}/attempts` - start an attempt
-- `GET /attempts/{attempt_id}` - resume an attempt and see saved answers/progress
-- `PUT /attempts/{attempt_id}/answers/{question_position}` - submit or overwrite an answer using option number 1-4
-- `POST /attempts/{attempt_id}/finish` - finish and score an attempt
+- `GET /quizzes/{quiz_id}/answers` - teacher gets correct answers for their own quiz
+- `POST /quizzes/{quiz_id}/attempts` - student starts an attempt
+- `GET /attempts/{attempt_id}` - student resumes their attempt and sees saved answers/progress
+- `PUT /attempts/{attempt_id}/answers/{question_position}` - student submits or overwrites an answer using option number 1-4
+- `POST /attempts/{attempt_id}/finish` - student finishes and scores an attempt
 - `GET /attempts/{attempt_id}/result` - get attempt result
-- `GET /quizzes/{quiz_id}/attempts` - creator lists all attempts for a quiz
+- `GET /quizzes/{quiz_id}/attempts` - teacher lists all attempts for their own quiz
 
 Attempts are lazily expired when an active attempt is accessed after its quiz time limit. The API scores submitted answers, marks the attempt `expired`, sets `completed_at`, and returns `409` with `{"detail": "Attempt has expired"}` for the request that detected expiry.
 
-User identity is represented by headers for this phase:
+## Auth Examples
 
-- `X-User-Id`
-- `X-User-Name` optional; send once when creating/updating the user name
+Register:
+
+```json
+{
+  "username": "teacher1",
+  "email": "teacher1@example.com",
+  "password": "secret123",
+  "role": "TEACHER"
+}
+```
+
+Login uses form data at `POST /auth/login`:
+
+```text
+username=teacher1&password=secret123
+```
+
+Protected endpoints require:
+
+```text
+Authorization: Bearer <access_token>
+```
+
+Students can see selected options on active attempts, but scores, correctness, and correct answers are hidden until their attempt is `completed` or `expired`. Teachers can view correct answers and attempt analytics only for quizzes they created.

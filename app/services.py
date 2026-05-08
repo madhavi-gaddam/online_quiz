@@ -134,6 +134,22 @@ def get_quiz_public(db: Session, quiz_id: int) -> models.Quiz:
     return quiz
 
 
+def get_quiz_with_answers(db: Session, quiz_id: int, teacher: models.User) -> models.Quiz:
+    quiz = get_quiz_public(db, quiz_id)
+    if quiz.creator_id != teacher.id:
+        logger.warning(
+            "Validation failure forbidden_quiz_answers user_id=%s quiz_id=%s creator_id=%s",
+            teacher.id,
+            quiz_id,
+            quiz.creator_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the quiz creator can view correct answers.",
+        )
+    return quiz
+
+
 def list_quizzes(db: Session) -> list[schemas.QuizSummaryPublic]:
     quizzes = db.scalars(
         select(models.Quiz)
@@ -145,7 +161,7 @@ def list_quizzes(db: Session) -> list[schemas.QuizSummaryPublic]:
         schemas.QuizSummaryPublic(
             id=quiz.id,
             creator_id=quiz.creator_id,
-            creator_name=quiz.creator.name,
+            creator_name=quiz.creator.username,
             title=quiz.title,
             description=quiz.description,
             time_limit_minutes=quiz.time_limit_minutes,
@@ -161,6 +177,12 @@ def start_attempt(db: Session, quiz_id: int, user: models.User) -> models.Attemp
     if not quiz:
         logger.warning("Validation failure quiz_not_found user_id=%s quiz_id=%s", user.id, quiz_id)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quiz not found.")
+    if quiz.creator_id == user.id:
+        logger.warning("Validation failure creator_cannot_attempt user_id=%s quiz_id=%s", user.id, quiz_id)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Quiz creators cannot take their own quizzes.",
+        )
 
     active_attempt = db.scalar(
         select(models.Attempt)
@@ -439,7 +461,7 @@ def get_attempt_for_user(db: Session, attempt_id: int, user_id: int) -> models.A
 def get_attempt_result(db: Session, attempt_id: int, user: models.User) -> schemas.AttemptResultPublic:
     attempt = db.scalar(
         select(models.Attempt)
-        .where(models.Attempt.id == attempt_id, models.Attempt.user_id == user.id)
+        .where(models.Attempt.id == attempt_id)
         .options(
             selectinload(models.Attempt.quiz)
             .selectinload(models.Quiz.questions)
@@ -451,37 +473,69 @@ def get_attempt_result(db: Session, attempt_id: int, user: models.User) -> schem
     if not attempt:
         logger.warning("Validation failure attempt_not_found user_id=%s attempt_id=%s", user.id, attempt_id)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found.")
+    is_student_owner = user.role == models.UserRole.student and attempt.user_id == user.id
+    is_teacher_owner = user.role == models.UserRole.teacher and attempt.quiz.creator_id == user.id
+    if not (is_student_owner or is_teacher_owner):
+        logger.warning(
+            "Validation failure forbidden_attempt_result user_id=%s attempt_id=%s quiz_id=%s",
+            user.id,
+            attempt_id,
+            attempt.quiz_id,
+        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not allowed to view this attempt.")
+
     check_and_handle_attempt_expiry(attempt, db)
-    if (
-        attempt.status not in {models.AttemptStatus.completed, models.AttemptStatus.expired}
-        or attempt.completed_at is None
-        or attempt.score is None
-    ):
-        logger.warning("Validation failure attempt_not_completed user_id=%s attempt_id=%s", user.id, attempt_id)
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Attempt is not completed.")
 
     results_by_question = {result.question_id: result for result in attempt.results}
+    answers_by_question = {answer.question_id: answer for answer in attempt.answers}
+    reveal_answers = is_teacher_owner or attempt.status in {
+        models.AttemptStatus.completed,
+        models.AttemptStatus.expired,
+    }
     return schemas.AttemptResultPublic(
         attempt_id=attempt.id,
         quiz_id=attempt.quiz_id,
         user_id=attempt.user_id,
-        score=attempt.score,
-        time_taken_seconds=seconds_between(attempt.started_at, attempt.completed_at),
+        status=attempt.status.value,
+        score=attempt.score if reveal_answers else None,
+        time_taken_seconds=(
+            seconds_between(attempt.started_at, attempt.completed_at)
+            if attempt.completed_at
+            else None
+        ),
         questions=[
             schemas.QuestionResultPublic(
                 question_position=question.position,
                 question_text=question.text,
                 selected_option=(
                     results_by_question[question.id].chosen_option.position
-                    if results_by_question[question.id].chosen_option
+                    if question.id in results_by_question and results_by_question[question.id].chosen_option
+                    else answers_by_question[question.id].chosen_option.position
+                    if question.id in answers_by_question
                     else None
                 ),
                 selected_option_text=(
                     results_by_question[question.id].chosen_option.text
-                    if results_by_question[question.id].chosen_option
+                    if question.id in results_by_question and results_by_question[question.id].chosen_option
+                    else answers_by_question[question.id].chosen_option.text
+                    if question.id in answers_by_question
                     else None
                 ),
-                is_correct=results_by_question[question.id].is_correct,
+                correct_option=(
+                    next(option.position for option in question.options if option.is_correct)
+                    if reveal_answers
+                    else None
+                ),
+                correct_option_text=(
+                    next(option.text for option in question.options if option.is_correct)
+                    if reveal_answers
+                    else None
+                ),
+                is_correct=(
+                    results_by_question[question.id].is_correct
+                    if reveal_answers and question.id in results_by_question
+                    else None
+                ),
             )
             for question in attempt.quiz.questions
         ],
@@ -512,15 +566,24 @@ def list_quiz_attempts(
     attempts = db.scalars(
         select(models.Attempt)
         .where(models.Attempt.quiz_id == quiz_id)
-        .options(selectinload(models.Attempt.user))
+        .options(
+            selectinload(models.Attempt.user),
+            selectinload(models.Attempt.quiz)
+            .selectinload(models.Quiz.questions)
+            .selectinload(models.Question.options),
+            selectinload(models.Attempt.answers),
+            selectinload(models.Attempt.results),
+        )
         .order_by(models.Attempt.started_at.desc())
     ).all()
+    for attempt in attempts:
+        check_and_handle_attempt_expiry(attempt, db)
 
     return [
         schemas.AttemptSummaryPublic(
             attempt_id=attempt.id,
             user_id=attempt.user_id,
-            user_name=attempt.user.name,
+            user_name=attempt.user.username,
             status=attempt.status.value,
             score=attempt.score,
             time_taken_seconds=(

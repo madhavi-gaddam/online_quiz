@@ -31,6 +31,10 @@ class OptionPublic(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class OptionWithAnswerPublic(OptionPublic):
+    is_correct: bool
+
+
 class QuestionPublic(BaseModel):
     text: str
     position: int
@@ -46,6 +50,25 @@ class QuizPublic(BaseModel):
     description: str
     time_limit_minutes: int
     questions: list[QuestionPublic]
+
+    model_config = {"from_attributes": True}
+
+
+class QuestionWithAnswersPublic(BaseModel):
+    text: str
+    position: int
+    options: list[OptionWithAnswerPublic]
+
+    model_config = {"from_attributes": True}
+
+
+class QuizWithAnswersPublic(BaseModel):
+    id: int
+    creator_id: int
+    title: str
+    description: str
+    time_limit_minutes: int
+    questions: list[QuestionWithAnswersPublic]
 
     model_config = {"from_attributes": True}
 
@@ -111,15 +134,18 @@ class QuestionResultPublic(BaseModel):
     question_text: str
     selected_option: int | None
     selected_option_text: str | None
-    is_correct: bool
+    correct_option: int | None = None
+    correct_option_text: str | None = None
+    is_correct: bool | None = None
 
 
 class AttemptResultPublic(BaseModel):
     attempt_id: int
     quiz_id: int
     user_id: int
-    score: float
-    time_taken_seconds: int
+    status: str
+    score: float | None
+    time_taken_seconds: int | None
     questions: list[QuestionResultPublic]
 
 
