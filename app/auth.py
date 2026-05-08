@@ -1,7 +1,12 @@
+import logging
+
 from fastapi import Header, HTTPException, status
 from sqlalchemy.orm import Session
 
 from . import models
+
+
+logger = logging.getLogger(__name__)
 
 
 def get_or_create_user(db: Session, user_id: int, user_name: str | None = None) -> models.User:
@@ -33,6 +38,7 @@ def require_user_headers(
     ),
 ) -> tuple[int, str | None]:
     if x_user_id is None:
+        logger.warning("Validation failure missing_header=X-User-Id")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="X-User-Id header is required.",

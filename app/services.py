@@ -1,10 +1,25 @@
+import logging
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
 from . import models, schemas
+
+
+logger = logging.getLogger(__name__)
+
+
+def commit_or_rollback(db: Session, message: str, **context: object) -> None:
+    try:
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        context_text = " ".join(f"{key}={value}" for key, value in context.items())
+        logger.exception("Database exception %s %s", message, context_text)
+        raise
 
 
 def aware_utc(value: datetime) -> datetime:
@@ -46,7 +61,8 @@ def create_quiz(db: Session, creator: models.User, payload: schemas.QuizCreate) 
         quiz.questions.append(question)
 
     db.add(quiz)
-    db.commit()
+    commit_or_rollback(db, "while creating quiz", user_id=creator.id)
+    logger.info("Quiz created user_id=%s quiz_id=%s question_count=%s", creator.id, quiz.id, len(quiz.questions))
     return get_quiz_public(db, quiz.id)
 
 
@@ -57,6 +73,7 @@ def get_quiz_public(db: Session, quiz_id: int) -> models.Quiz:
         .options(selectinload(models.Quiz.questions).selectinload(models.Question.options))
     )
     if not quiz:
+        logger.warning("Validation failure quiz_not_found quiz_id=%s", quiz_id)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quiz not found.")
     return quiz
 
@@ -64,6 +81,7 @@ def get_quiz_public(db: Session, quiz_id: int) -> models.Quiz:
 def start_attempt(db: Session, quiz_id: int, user: models.User) -> models.Attempt:
     quiz = db.get(models.Quiz, quiz_id)
     if not quiz:
+        logger.warning("Validation failure quiz_not_found user_id=%s quiz_id=%s", user.id, quiz_id)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quiz not found.")
 
     active_attempt = db.scalar(
@@ -74,6 +92,12 @@ def start_attempt(db: Session, quiz_id: int, user: models.User) -> models.Attemp
         )
     )
     if active_attempt:
+        logger.warning(
+            "Validation failure active_attempt_exists user_id=%s quiz_id=%s attempt_id=%s",
+            user.id,
+            quiz_id,
+            active_attempt.id,
+        )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="User already has an active attempt for this quiz.",
@@ -81,8 +105,9 @@ def start_attempt(db: Session, quiz_id: int, user: models.User) -> models.Attemp
 
     attempt = models.Attempt(quiz_id=quiz_id, user_id=user.id)
     db.add(attempt)
-    db.commit()
+    commit_or_rollback(db, "while starting attempt", user_id=user.id, quiz_id=quiz_id)
     db.refresh(attempt)
+    logger.info("Attempt started user_id=%s quiz_id=%s attempt_id=%s", user.id, quiz_id, attempt.id)
     return attempt
 
 
@@ -99,13 +124,27 @@ def submit_answer(
         .options(selectinload(models.Attempt.quiz))
     )
     if not attempt:
+        logger.warning("Validation failure attempt_not_found user_id=%s attempt_id=%s", user.id, attempt_id)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found.")
     if attempt.status != models.AttemptStatus.active:
+        logger.warning(
+            "Validation failure attempt_not_active user_id=%s quiz_id=%s attempt_id=%s status=%s",
+            user.id,
+            attempt.quiz_id,
+            attempt_id,
+            attempt.status.value,
+        )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Finished attempts cannot be changed.",
         )
     if attempt_time_limit_exceeded(attempt):
+        logger.warning(
+            "Validation failure time_limit_exceeded user_id=%s quiz_id=%s attempt_id=%s",
+            user.id,
+            attempt.quiz_id,
+            attempt_id,
+        )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Time limit exceeded. Finish the attempt to get the result.",
@@ -120,6 +159,13 @@ def submit_answer(
         .options(selectinload(models.Question.options))
     )
     if not question:
+        logger.warning(
+            "Validation failure question_not_found user_id=%s quiz_id=%s attempt_id=%s question_position=%s",
+            user.id,
+            attempt.quiz_id,
+            attempt_id,
+            question_position,
+        )
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Question position not found for this attempt's quiz.",
@@ -127,6 +173,14 @@ def submit_answer(
 
     option = next((candidate for candidate in question.options if candidate.position == selected_option), None)
     if not option:
+        logger.warning(
+            "Validation failure invalid_option user_id=%s quiz_id=%s attempt_id=%s question_id=%s selected_option=%s",
+            user.id,
+            attempt.quiz_id,
+            attempt_id,
+            question.id,
+            selected_option,
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Selected option must be a valid option number for this question.",
@@ -149,8 +203,23 @@ def submit_answer(
         )
         db.add(answer)
 
-    db.commit()
+    commit_or_rollback(
+        db,
+        "while submitting answer",
+        user_id=user.id,
+        quiz_id=attempt.quiz_id,
+        attempt_id=attempt_id,
+        question_id=question.id,
+    )
     db.refresh(answer)
+    logger.info(
+        "Answer submitted user_id=%s quiz_id=%s attempt_id=%s question_id=%s selected_option=%s",
+        user.id,
+        attempt.quiz_id,
+        attempt_id,
+        question.id,
+        option.position,
+    )
     return schemas.AnswerPublic(
         attempt_id=attempt_id,
         question_position=question.position,
@@ -171,8 +240,15 @@ def finish_attempt(db: Session, attempt_id: int, user: models.User) -> models.At
         )
     )
     if not attempt:
+        logger.warning("Validation failure attempt_not_found user_id=%s attempt_id=%s", user.id, attempt_id)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found.")
     if attempt.status != models.AttemptStatus.active:
+        logger.warning(
+            "Validation failure attempt_already_finished user_id=%s quiz_id=%s attempt_id=%s",
+            user.id,
+            attempt.quiz_id,
+            attempt_id,
+        )
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Attempt is already finished.")
 
     answers_by_question = {answer.question_id: answer for answer in attempt.answers}
@@ -200,8 +276,21 @@ def finish_attempt(db: Session, attempt_id: int, user: models.User) -> models.At
     attempt.score = round((correct_count / total_questions) * 100, 2) if total_questions else 0.0
     attempt.status = models.AttemptStatus.finished
     attempt.finished_at = models.utc_now()
-    db.commit()
+    commit_or_rollback(
+        db,
+        "while finishing attempt",
+        user_id=user.id,
+        quiz_id=attempt.quiz_id,
+        attempt_id=attempt_id,
+    )
     db.refresh(attempt)
+    logger.info(
+        "Attempt finished user_id=%s quiz_id=%s attempt_id=%s score=%s",
+        user.id,
+        attempt.quiz_id,
+        attempt_id,
+        attempt.score,
+    )
     return attempt
 
 
@@ -213,6 +302,7 @@ def get_attempt_for_user(db: Session, attempt_id: int, user_id: int) -> models.A
         )
     )
     if not attempt:
+        logger.warning("Validation failure attempt_not_found user_id=%s attempt_id=%s", user_id, attempt_id)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found.")
     return attempt
 
@@ -229,8 +319,10 @@ def get_attempt_result(db: Session, attempt_id: int, user: models.User) -> schem
         )
     )
     if not attempt:
+        logger.warning("Validation failure attempt_not_found user_id=%s attempt_id=%s", user.id, attempt_id)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found.")
     if attempt.status != models.AttemptStatus.finished or attempt.finished_at is None or attempt.score is None:
+        logger.warning("Validation failure attempt_not_finished user_id=%s attempt_id=%s", user.id, attempt_id)
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Attempt is not finished.")
 
     results_by_question = {result.question_id: result for result in attempt.results}
@@ -268,8 +360,15 @@ def list_quiz_attempts(
 ) -> list[schemas.AttemptSummaryPublic]:
     quiz = db.get(models.Quiz, quiz_id)
     if not quiz:
+        logger.warning("Validation failure quiz_not_found user_id=%s quiz_id=%s", creator.id, quiz_id)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quiz not found.")
     if quiz.creator_id != creator.id:
+        logger.warning(
+            "Validation failure forbidden_attempt_listing user_id=%s quiz_id=%s creator_id=%s",
+            creator.id,
+            quiz_id,
+            quiz.creator_id,
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only the quiz creator can list attempts.",

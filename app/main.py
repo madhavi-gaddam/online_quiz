@@ -1,21 +1,47 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+import logging
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Path, status
+from fastapi import Depends, FastAPI, Path, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from . import auth, models, schemas, services
+from .core.logger import setup_logging
+from .core.middleware import RequestLoggingMiddleware
 from .database import Base, engine, get_db
+
+
+setup_logging()
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     Base.metadata.create_all(bind=engine)
+    logger.info("Application startup completed")
     yield
+    logger.info("Application shutdown completed")
 
 
 app = FastAPI(title="Online Quiz Exam API", version="0.1.0", lifespan=lifespan)
+app.add_middleware(RequestLoggingMiddleware)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    logger.warning(
+        "Request validation failure method=%s path=%s error_count=%s",
+        request.method,
+        request.url.path,
+        len(exc.errors()),
+    )
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": exc.errors()},
+    )
 
 
 def current_user(
