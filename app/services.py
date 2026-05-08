@@ -36,9 +36,65 @@ def attempt_deadline(attempt: models.Attempt) -> datetime:
     return aware_utc(attempt.started_at) + timedelta(minutes=attempt.quiz.time_limit_minutes)
 
 
-def attempt_time_limit_exceeded(attempt: models.Attempt, now: datetime | None = None) -> bool:
-    checked_at = aware_utc(now or models.utc_now())
-    return checked_at > attempt_deadline(attempt)
+def score_attempt(attempt: models.Attempt) -> None:
+    answers_by_question = {answer.question_id: answer for answer in attempt.answers}
+    results_by_question = {result.question_id: result for result in attempt.results}
+    correct_count = 0
+
+    for question in attempt.quiz.questions:
+        answer = answers_by_question.get(question.id)
+        chosen_option_id = answer.chosen_option_id if answer else None
+        chosen_option = next(
+            (option for option in question.options if option.id == chosen_option_id),
+            None,
+        )
+        is_correct = bool(chosen_option and chosen_option.is_correct)
+        correct_count += int(is_correct)
+
+        result = results_by_question.get(question.id)
+        if result:
+            result.chosen_option_id = chosen_option_id
+            result.is_correct = is_correct
+        else:
+            attempt.results.append(
+                models.AttemptQuestionResult(
+                    attempt_id=attempt.id,
+                    question_id=question.id,
+                    chosen_option_id=chosen_option_id,
+                    is_correct=is_correct,
+                )
+            )
+
+    total_questions = len(attempt.quiz.questions)
+    attempt.score = round((correct_count / total_questions) * 100, 2) if total_questions else 0.0
+
+
+def check_and_handle_attempt_expiry(attempt: models.Attempt, db: Session) -> None:
+    if attempt.status != models.AttemptStatus.active:
+        return
+
+    deadline_at = attempt_deadline(attempt)
+    if aware_utc(models.utc_now()) <= deadline_at:
+        return
+
+    score_attempt(attempt)
+    attempt.status = models.AttemptStatus.expired
+    attempt.completed_at = deadline_at
+    commit_or_rollback(
+        db,
+        "while expiring attempt",
+        user_id=attempt.user_id,
+        quiz_id=attempt.quiz_id,
+        attempt_id=attempt.id,
+    )
+    logger.info(
+        "Attempt expired user_id=%s quiz_id=%s attempt_id=%s score=%s",
+        attempt.user_id,
+        attempt.quiz_id,
+        attempt.id,
+        attempt.score,
+    )
+    raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Attempt has expired")
 
 
 def create_quiz(db: Session, creator: models.User, payload: schemas.QuizCreate) -> models.Quiz:
@@ -78,6 +134,28 @@ def get_quiz_public(db: Session, quiz_id: int) -> models.Quiz:
     return quiz
 
 
+def list_quizzes(db: Session) -> list[schemas.QuizSummaryPublic]:
+    quizzes = db.scalars(
+        select(models.Quiz)
+        .options(selectinload(models.Quiz.creator), selectinload(models.Quiz.questions))
+        .order_by(models.Quiz.created_at.desc())
+    ).all()
+
+    return [
+        schemas.QuizSummaryPublic(
+            id=quiz.id,
+            creator_id=quiz.creator_id,
+            creator_name=quiz.creator.name,
+            title=quiz.title,
+            description=quiz.description,
+            time_limit_minutes=quiz.time_limit_minutes,
+            question_count=len(quiz.questions),
+            created_at=quiz.created_at,
+        )
+        for quiz in quizzes
+    ]
+
+
 def start_attempt(db: Session, quiz_id: int, user: models.User) -> models.Attempt:
     quiz = db.get(models.Quiz, quiz_id)
     if not quiz:
@@ -85,13 +163,22 @@ def start_attempt(db: Session, quiz_id: int, user: models.User) -> models.Attemp
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quiz not found.")
 
     active_attempt = db.scalar(
-        select(models.Attempt).where(
+        select(models.Attempt)
+        .where(
             models.Attempt.quiz_id == quiz_id,
             models.Attempt.user_id == user.id,
             models.Attempt.status == models.AttemptStatus.active,
         )
+        .options(
+            selectinload(models.Attempt.quiz)
+            .selectinload(models.Quiz.questions)
+            .selectinload(models.Question.options),
+            selectinload(models.Attempt.answers),
+            selectinload(models.Attempt.results),
+        )
     )
     if active_attempt:
+        check_and_handle_attempt_expiry(active_attempt, db)
         logger.warning(
             "Validation failure active_attempt_exists user_id=%s quiz_id=%s attempt_id=%s",
             user.id,
@@ -121,11 +208,18 @@ def submit_answer(
     attempt = db.scalar(
         select(models.Attempt)
         .where(models.Attempt.id == attempt_id, models.Attempt.user_id == user.id)
-        .options(selectinload(models.Attempt.quiz))
+        .options(
+            selectinload(models.Attempt.quiz)
+            .selectinload(models.Quiz.questions)
+            .selectinload(models.Question.options),
+            selectinload(models.Attempt.answers),
+            selectinload(models.Attempt.results),
+        )
     )
     if not attempt:
         logger.warning("Validation failure attempt_not_found user_id=%s attempt_id=%s", user.id, attempt_id)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found.")
+    check_and_handle_attempt_expiry(attempt, db)
     if attempt.status != models.AttemptStatus.active:
         logger.warning(
             "Validation failure attempt_not_active user_id=%s quiz_id=%s attempt_id=%s status=%s",
@@ -136,18 +230,11 @@ def submit_answer(
         )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Finished attempts cannot be changed.",
-        )
-    if attempt_time_limit_exceeded(attempt):
-        logger.warning(
-            "Validation failure time_limit_exceeded user_id=%s quiz_id=%s attempt_id=%s",
-            user.id,
-            attempt.quiz_id,
-            attempt_id,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Time limit exceeded. Finish the attempt to get the result.",
+            detail=(
+                "Attempt has expired"
+                if attempt.status == models.AttemptStatus.expired
+                else "Completed attempts cannot be changed."
+            ),
         )
 
     question = db.scalar(
@@ -228,6 +315,60 @@ def submit_answer(
     )
 
 
+def get_attempt_progress(db: Session, attempt_id: int, user: models.User) -> schemas.AttemptProgressPublic:
+    attempt = db.scalar(
+        select(models.Attempt)
+        .where(models.Attempt.id == attempt_id, models.Attempt.user_id == user.id)
+        .options(
+            selectinload(models.Attempt.quiz)
+            .selectinload(models.Quiz.questions)
+            .selectinload(models.Question.options),
+            selectinload(models.Attempt.answers).selectinload(models.Answer.chosen_option),
+            selectinload(models.Attempt.results),
+        )
+    )
+    if not attempt:
+        logger.warning("Validation failure attempt_not_found user_id=%s attempt_id=%s", user.id, attempt_id)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found.")
+    check_and_handle_attempt_expiry(attempt, db)
+
+    answers_by_question = {answer.question_id: answer for answer in attempt.answers}
+    deadline_at = attempt_deadline(attempt)
+    remaining_seconds = (
+        max(0, seconds_between(models.utc_now(), deadline_at))
+        if attempt.status == models.AttemptStatus.active
+        else 0
+    )
+
+    return schemas.AttemptProgressPublic(
+        attempt_id=attempt.id,
+        quiz_id=attempt.quiz_id,
+        quiz_title=attempt.quiz.title,
+        status=attempt.status.value,
+        started_at=attempt.started_at,
+        deadline_at=deadline_at,
+        remaining_seconds=remaining_seconds,
+        answered_questions=len(answers_by_question),
+        total_questions=len(attempt.quiz.questions),
+        questions=[
+            schemas.AttemptQuestionProgressPublic(
+                question_position=question.position,
+                question_text=question.text,
+                options=[
+                    schemas.OptionPublic(text=option.text, position=option.position)
+                    for option in question.options
+                ],
+                selected_option=(
+                    answers_by_question[question.id].chosen_option.position
+                    if question.id in answers_by_question
+                    else None
+                ),
+            )
+            for question in attempt.quiz.questions
+        ],
+    )
+
+
 def finish_attempt(db: Session, attempt_id: int, user: models.User) -> models.Attempt:
     attempt = db.scalar(
         select(models.Attempt)
@@ -237,45 +378,33 @@ def finish_attempt(db: Session, attempt_id: int, user: models.User) -> models.At
             .selectinload(models.Quiz.questions)
             .selectinload(models.Question.options),
             selectinload(models.Attempt.answers),
+            selectinload(models.Attempt.results),
         )
     )
     if not attempt:
         logger.warning("Validation failure attempt_not_found user_id=%s attempt_id=%s", user.id, attempt_id)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found.")
+    check_and_handle_attempt_expiry(attempt, db)
     if attempt.status != models.AttemptStatus.active:
         logger.warning(
-            "Validation failure attempt_already_finished user_id=%s quiz_id=%s attempt_id=%s",
+            "Validation failure attempt_not_active user_id=%s quiz_id=%s attempt_id=%s status=%s",
             user.id,
             attempt.quiz_id,
             attempt_id,
+            attempt.status.value,
         )
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Attempt is already finished.")
-
-    answers_by_question = {answer.question_id: answer for answer in attempt.answers}
-    correct_count = 0
-
-    for question in attempt.quiz.questions:
-        answer = answers_by_question.get(question.id)
-        chosen_option_id = answer.chosen_option_id if answer else None
-        chosen_option = next(
-            (option for option in question.options if option.id == chosen_option_id),
-            None,
-        )
-        is_correct = bool(chosen_option and chosen_option.is_correct)
-        correct_count += int(is_correct)
-        db.add(
-            models.AttemptQuestionResult(
-                attempt_id=attempt.id,
-                question_id=question.id,
-                chosen_option_id=chosen_option_id,
-                is_correct=is_correct,
-            )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Attempt has expired"
+                if attempt.status == models.AttemptStatus.expired
+                else "Attempt is already completed."
+            ),
         )
 
-    total_questions = len(attempt.quiz.questions)
-    attempt.score = round((correct_count / total_questions) * 100, 2) if total_questions else 0.0
-    attempt.status = models.AttemptStatus.finished
-    attempt.finished_at = models.utc_now()
+    score_attempt(attempt)
+    attempt.status = models.AttemptStatus.completed
+    attempt.completed_at = models.utc_now()
     commit_or_rollback(
         db,
         "while finishing attempt",
@@ -285,7 +414,7 @@ def finish_attempt(db: Session, attempt_id: int, user: models.User) -> models.At
     )
     db.refresh(attempt)
     logger.info(
-        "Attempt finished user_id=%s quiz_id=%s attempt_id=%s score=%s",
+        "Attempt completed user_id=%s quiz_id=%s attempt_id=%s score=%s",
         user.id,
         attempt.quiz_id,
         attempt_id,
@@ -315,15 +444,21 @@ def get_attempt_result(db: Session, attempt_id: int, user: models.User) -> schem
             selectinload(models.Attempt.quiz)
             .selectinload(models.Quiz.questions)
             .selectinload(models.Question.options),
+            selectinload(models.Attempt.answers),
             selectinload(models.Attempt.results).selectinload(models.AttemptQuestionResult.chosen_option),
         )
     )
     if not attempt:
         logger.warning("Validation failure attempt_not_found user_id=%s attempt_id=%s", user.id, attempt_id)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found.")
-    if attempt.status != models.AttemptStatus.finished or attempt.finished_at is None or attempt.score is None:
-        logger.warning("Validation failure attempt_not_finished user_id=%s attempt_id=%s", user.id, attempt_id)
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Attempt is not finished.")
+    check_and_handle_attempt_expiry(attempt, db)
+    if (
+        attempt.status not in {models.AttemptStatus.completed, models.AttemptStatus.expired}
+        or attempt.completed_at is None
+        or attempt.score is None
+    ):
+        logger.warning("Validation failure attempt_not_completed user_id=%s attempt_id=%s", user.id, attempt_id)
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Attempt is not completed.")
 
     results_by_question = {result.question_id: result for result in attempt.results}
     return schemas.AttemptResultPublic(
@@ -331,7 +466,7 @@ def get_attempt_result(db: Session, attempt_id: int, user: models.User) -> schem
         quiz_id=attempt.quiz_id,
         user_id=attempt.user_id,
         score=attempt.score,
-        time_taken_seconds=seconds_between(attempt.started_at, attempt.finished_at),
+        time_taken_seconds=seconds_between(attempt.started_at, attempt.completed_at),
         questions=[
             schemas.QuestionResultPublic(
                 question_position=question.position,
@@ -389,8 +524,8 @@ def list_quiz_attempts(
             status=attempt.status.value,
             score=attempt.score,
             time_taken_seconds=(
-                seconds_between(attempt.started_at, attempt.finished_at)
-                if attempt.finished_at
+                seconds_between(attempt.started_at, attempt.completed_at)
+                if attempt.completed_at
                 else None
             ),
         )

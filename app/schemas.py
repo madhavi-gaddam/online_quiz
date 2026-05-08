@@ -50,6 +50,17 @@ class QuizPublic(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class QuizSummaryPublic(BaseModel):
+    id: int
+    creator_id: int
+    creator_name: str
+    title: str
+    description: str
+    time_limit_minutes: int
+    question_count: int
+    created_at: datetime
+
+
 class AttemptPublic(BaseModel):
     id: int
     quiz_id: int
@@ -73,6 +84,26 @@ class AnswerPublic(BaseModel):
     question_position: int
     selected_option: int
     submitted_at: datetime
+
+
+class AttemptQuestionProgressPublic(BaseModel):
+    question_position: int
+    question_text: str
+    options: list[OptionPublic]
+    selected_option: int | None
+
+
+class AttemptProgressPublic(BaseModel):
+    attempt_id: int
+    quiz_id: int
+    quiz_title: str
+    status: str
+    started_at: datetime
+    deadline_at: datetime
+    remaining_seconds: int
+    answered_questions: int
+    total_questions: int
+    questions: list[AttemptQuestionProgressPublic]
 
 
 class QuestionResultPublic(BaseModel):

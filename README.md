@@ -1,6 +1,6 @@
 # Online Quiz Exam Backend
 
-Phase 1 backend service for creating and taking MCQ quizzes.
+Backend service for creating, browsing, and taking MCQ quizzes.
 
 ## Stack
 
@@ -33,12 +33,17 @@ The API will create tables on startup for Phase 1 simplicity. In a production ph
 
 ## Main Endpoints
 
+- `GET /quizzes` - list available quizzes
 - `POST /quizzes` - create a quiz
+- `GET /quizzes/{quiz_id}` - get quiz details without correct answers
 - `POST /quizzes/{quiz_id}/attempts` - start an attempt
+- `GET /attempts/{attempt_id}` - resume an attempt and see saved answers/progress
 - `PUT /attempts/{attempt_id}/answers/{question_position}` - submit or overwrite an answer using option number 1-4
 - `POST /attempts/{attempt_id}/finish` - finish and score an attempt
 - `GET /attempts/{attempt_id}/result` - get attempt result
 - `GET /quizzes/{quiz_id}/attempts` - creator lists all attempts for a quiz
+
+Attempts are lazily expired when an active attempt is accessed after its quiz time limit. The API scores submitted answers, marks the attempt `expired`, sets `completed_at`, and returns `409` with `{"detail": "Attempt has expired"}` for the request that detected expiry.
 
 User identity is represented by headers for this phase:
 

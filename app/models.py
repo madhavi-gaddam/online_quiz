@@ -23,7 +23,8 @@ def utc_now() -> datetime:
 
 class AttemptStatus(str, Enum):
     active = "active"
-    finished = "finished"
+    completed = "completed"
+    expired = "expired"
 
 
 class User(Base):
@@ -100,7 +101,7 @@ class Attempt(Base):
         index=True,
     )
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column("finished_at", DateTime(timezone=True), nullable=True)
     score: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     quiz: Mapped[Quiz] = relationship(back_populates="attempts")

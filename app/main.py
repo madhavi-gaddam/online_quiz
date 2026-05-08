@@ -1,48 +1,21 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-import logging
-from typing import Annotated
 
-from fastapi import Depends, FastAPI, Path, Request, status
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, status
 from sqlalchemy.orm import Session
 
 from . import auth, models, schemas, services
-from .core.logger import setup_logging
-from .core.middleware import RequestLoggingMiddleware
 from .database import Base, engine, get_db
-
-
-setup_logging()
-logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     Base.metadata.create_all(bind=engine)
-    logger.info("Application startup completed")
     yield
-    logger.info("Application shutdown completed")
 
 
 app = FastAPI(title="Online Quiz Exam API", version="0.1.0", lifespan=lifespan)
-app.add_middleware(RequestLoggingMiddleware)
-
-
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
-    logger.warning(
-        "Request validation failure method=%s path=%s error_count=%s",
-        request.method,
-        request.url.path,
-        len(exc.errors()),
-    )
-    return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"detail": exc.errors()},
-    )
-
+ 
 
 def current_user(
     user_headers: tuple[int, str | None] = Depends(auth.require_user_headers),
@@ -84,20 +57,17 @@ def start_attempt(
 
 
 @app.put(
-    "/attempts/{attempt_id}/answers/{question_position}",
+    "/attempts/{attempt_id}/answers/{question_id}",
     response_model=schemas.AnswerPublic,
 )
 def submit_answer(
     attempt_id: int,
-    question_position: Annotated[
-        int,
-        Path(ge=1, description="Question number in the quiz, starting from 1."),
-    ],
+    question_id: int,
     payload: schemas.AnswerSubmit,
     db: Session = Depends(get_db),
     user: models.User = Depends(current_user),
-) -> schemas.AnswerPublic:
-    return services.submit_answer(db, attempt_id, question_position, payload.selected_option, user)
+) -> models.Answer:
+    return services.submit_answer(db, attempt_id, question_id, payload.option_id, user)
 
 
 @app.post("/attempts/{attempt_id}/finish", response_model=schemas.AttemptResultPublic)
