@@ -67,10 +67,13 @@ Register:
 }
 ```
 
-Login uses form data at `POST /auth/login`:
+Login uses JSON at `POST /auth/login`:
 
-```text
-username=teacher1&password=secret123
+```json
+{
+  "username": "teacher1",
+  "password": "secret123"
+}
 ```
 
 Protected endpoints require:

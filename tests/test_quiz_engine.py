@@ -53,8 +53,7 @@ def register(client: TestClient, username: str, role: str) -> dict:
 def login(client: TestClient, username: str, password: str = "secret123") -> str:
     response = client.post(
         "/auth/login",
-        data={"username": username, "password": password},
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        json={"username": username, "password": password},
     )
     assert response.status_code == 200
     return response.json()["access_token"]
@@ -149,8 +148,7 @@ def test_register_login_invalid_password_and_invalid_token(client: TestClient) -
 
     invalid_password = client.post(
         "/auth/login",
-        data={"username": "teacher1", "password": "wrong"},
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        json={"username": "teacher1", "password": "wrong"},
     )
     assert invalid_password.status_code == 401
 
